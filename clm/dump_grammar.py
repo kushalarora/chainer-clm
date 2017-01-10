@@ -1,4 +1,4 @@
-from edu.stanford.nlp.parser.lexparser import LexicalizedParser
+from edu.stanford.nlp.parser.lexparser import LexicalizedParser, Lexicon
 from math import exp, log
 
 
@@ -66,7 +66,7 @@ class InsideScorer(object):
                 i_score[span][state] = exp(lexScore)
 
     def unaryScore(self, i_score, span):
-        for state in i_score[span].keys():
+        for state in i_score.get(span, {}).keys():
             is_val = log(i_score[span][state])
 
             for ur in self.ug.closedRulesByChild(state):
@@ -83,26 +83,26 @@ class InsideScorer(object):
             right_span = (start, split)
             left_span = (split, end)
 
-            for rstate in i_score[right_span].keys():
+            for rstate in i_score.get(right_span, {}).keys():
                 for br in self.bg.splitRulesWithRC(rstate):
                     lstate = br.leftChild
                     pstate = br.parent()
                     rule_score = br.score()
 
-                    if lstate not in i_score[left_span].keys():
+                    if lstate not in i_score.get(left_span, {}).keys():
                         continue
 
                     if span not in i_score:
                         i_score[span] = {}
                     i_score[span][pstate] = exp(rule_score)
 
-            for lstate in i_score[left_span].keys():
+            for lstate in i_score.get(left_span, {}).keys():
                 for br in self.bg.splitRulesWithLC(lstate):
                     rstate = br.rightChild
                     pstate = br.parent()
                     rule_score = br.score()
 
-                    if rstate not in i_score[right_span].keys():
+                    if rstate not in i_score.get(right_span, {}).keys():
                         continue
 
                     if span not in i_score:
@@ -112,17 +112,19 @@ class InsideScorer(object):
         # unary
         self.unaryScore(i_score, span)
 
-    def calculateScore(self, input_filename):
+    def calculateScore(self, input_filename, lower_case=False):
         i_scores = {}
         with open(input_filename) as f:
             for sentence in f:
                 sentence = sentence.strip()
-                print "Processing Sentence: '%s'(%d)" % (sentence.lower(), len(sentence.split()))
-                length = len(sentence.split())
-                i_score = {}
+                print "Processing Sentence: '%s'" % sentence
+
                 print "Computing Lex Score"
-                for word in [Word(i, word, self.getToken(word, i)) \
-                                for i, word in enumerate(sentence.split())]:
+                words = sentence.split()
+                length = len(words)
+
+                i_score = {}
+                for word in [Word(i, word, self.getToken(word, i, lower_case)) for i, word in enumerate(words)]:
                     start = word.loc
                     end = start + 1
                     span = (start, end)
@@ -134,9 +136,9 @@ class InsideScorer(object):
                     self.unaryScore(i_score, span)
 
                 print "Computing inside score"
-                for diff in xrange(2, length):
+                for diff in xrange(2, length + 1):
                     print "Compute inside score for span size: %d" % diff
-                    for start in xrange(0, length - diff):
+                    for start in xrange(0, length - diff + 1):
                         self.insideChartCell(i_score, start, diff)
 
                 print "Done computing inside score"
@@ -148,9 +150,11 @@ if __name__ == '__main__':
     parser.add_argument('--input_filename', '-f', type=str, help='input file for calculating iscores')
     parser.add_argument('--grammar', '-g', type=str, default='englishPCFG', help='Stanford Grammar file')
     parser.add_argument('--output_filename', '-o', type=str, help='Pickled i_scores', default='data/grammar.p')
+    parser.add_argument('--lower_case', help='lowercase input', action='store_true')
+    parser.set_defaults(lower_case=False)
 
     args = parser.parse_args()
     iscorer = InsideScorer(args.grammar)
-    i_scores = iscorer.calculateScore(args.input_filename)
+    i_scores = iscorer.calculateScore(args.input_filename, args.lower_case)
 
     pickle.dump(i_scores, open(args.output_filename, 'wb'))
