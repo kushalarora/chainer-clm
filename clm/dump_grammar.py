@@ -54,7 +54,7 @@ class InsideScorer(object):
                     signature = self.lex.getUnknownWordModel().getSignature(word, loc)
         return signature
 
-    def lexScore(self, i_score, word, start, span):
+    def lexScore(self, i_score, rule_dict, word, start, span):
         if span not in i_score:
             i_score[span] = {}
 
@@ -68,34 +68,36 @@ class InsideScorer(object):
             if (lexScore > float('-inf')):
 
                 if state not in i_score[span]:
-                    i_score[span][state] = {}
+                    i_score[span][state] = set([])
 
                 rule = '%s %s' % (state, index)
-                if rule not in i_score[span][state]:
-                    i_score[span][state][rule] = 0
+                i_score[span][state].add(rule)
 
-                i_score[span][state][rule] += exp(lexScore)
+                if rule not in rule_dict:
+                    rule_dict[rule] = exp(lexScore)
 
-    def unaryScore(self, i_score, span):
-        for state, rule_to_val in i_score[span].iteritems():
+    def unaryScore(self, i_score, rule_dict, span):
+        for state, rule_set in i_score[span].iteritems():
             for ur in self.ug.closedRulesByChild(state):
                 pstate = ur.parent()
                 ps = ur.score()
 
                 if pstate not in i_score[span]:
-                    i_score[span][pstate] = {}
+                    i_score[span][pstate] = set([])
 
-                for rule, score  in rule_to_val.iteritems():
+                for rule in rule_set:
+                    score = rule_dict[rule]
+
                     rule_split = rule.split()
                     rule_split[0] = str(pstate)
-                    rule = " ".join(rule_split)
+                    new_rule = " ".join(rule_split)
 
-                    if rule not in i_score[span][pstate]:
-                        i_score[span][pstate][rule] = 0
+                    i_score[span][pstate].add(new_rule)
 
-                    i_score[span][pstate][rule] += exp(log(score) + ps)
+                    if new_rule not in rule_dict:
+                        rule_dict[new_rule] = exp(log(score) + ps)
 
-    def insideChartCell(self, i_score, start, diff):
+    def insideChartCell(self, i_score, rule_dict, start, diff):
         end = start + diff
         span = (start, end)
 
@@ -116,13 +118,13 @@ class InsideScorer(object):
                         continue
 
                     if pstate not in i_score[span]:
-                        i_score[span][pstate] = {}
+                        i_score[span][pstate] = set([])
 
                     rule = '%s %s %s' % (pstate, lstate, rstate)
-                    if rule not in i_score[span][pstate]:
-                        i_score[span][pstate][rule] = 0
+                    i_score[span][pstate].add(rule)
 
-                    i_score[span][pstate][rule] += exp(rule_score)
+                    if rule not in rule_dict:
+                        rule_dict[rule] = exp(rule_score)
 
             for lstate in i_score[left_span].keys():
                 for br in self.bg.splitRulesWithLC(lstate):
@@ -134,16 +136,16 @@ class InsideScorer(object):
                         continue
 
                     if pstate not in i_score[span]:
-                        i_score[span][pstate] = {}
+                        i_score[span][pstate] = set([])
 
                     rule = '%s %s %s' % (pstate, lstate, rstate)
-                    if rule not in i_score[span][pstate]:
-                        i_score[span][pstate][rule] = 0
+                    i_score[span][pstate].add(rule)
 
-                    i_score[span][pstate][rule] += exp(rule_score)
+                    if rule not in rule_dict:
+                        rule_dict[rule] = exp(rule_score)
 
         # unary
-        self.unaryScore(i_score, span)
+        self.unaryScore(i_score, rule_dict, span)
 
     def calculateScore(self, input_filename, lower_case=False):
 
@@ -151,6 +153,7 @@ class InsideScorer(object):
             self.output_filename = "%s.grammar" % input_filename
 
         Grmr = shelve.open(self.output_filename)
+        Grmr.clear()
         with open(self.output_filename, 'w+') as fout:
             # write out metadata
             Grmr['metadata'] = {'version': 1.0,
@@ -158,8 +161,9 @@ class InsideScorer(object):
                                 'grammar': self.grammar,
                                 'num_states': self.num_states
                                 }
-
+            Grmr['rules'] = {}
         with open(input_filename) as fin:
+            rule_dict = Grmr['rules']
             for sentence in fin:
                 sentence = sentence.strip()
                 print "Processing Sentence: '%s'" % sentence
@@ -176,16 +180,16 @@ class InsideScorer(object):
                     span = (start, end)
 
                     # Lex Score
-                    self.lexScore(i_score, word, start, span)
+                    self.lexScore(i_score, rule_dict, word, start, span)
 
                     # unary
-                    self.unaryScore(i_score, span)
+                    self.unaryScore(i_score, rule_dict, span)
 
                 print "Computing inside score"
                 for diff in xrange(2, length + 1):
                     print "Compute inside score for span size: %d" % diff
                     for start in xrange(0, length - diff + 1):
-                        self.insideChartCell(i_score, start, diff)
+                        self.insideChartCell(i_score, rule_dict, start, diff)
 
                 print "Done computing inside score"
 
