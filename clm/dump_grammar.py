@@ -55,6 +55,9 @@ class InsideScorer(object):
         return signature
 
     def lexScore(self, i_score, word, start, span):
+        if span not in i_score:
+            i_score[span] = {}
+
         index = self.wordIndex.indexOf(word.signature)
         tagIter = self.lex.ruleIteratorByWord(index, start, None)
         while(tagIter.hasNext()):
@@ -63,8 +66,6 @@ class InsideScorer(object):
             lexScore = self.lex.score(tag, start, word.signature, None)
 
             if (lexScore > float('-inf')):
-                if span not in i_score:
-                    i_score[span] = {}
 
                 if state not in i_score[span]:
                     i_score[span][state] = {}
@@ -98,6 +99,9 @@ class InsideScorer(object):
         end = start + diff
         span = (start, end)
 
+        if span not in i_score:
+            i_score[span] = {}
+
         for split in xrange(start + 1, end):
             left_span = (start, split)
             right_span = (split, end)
@@ -110,9 +114,6 @@ class InsideScorer(object):
 
                     if lstate not in i_score[left_span]:
                         continue
-
-                    if span not in i_score:
-                        i_score[span] = {}
 
                     if pstate not in i_score[span]:
                         i_score[span][pstate] = {}
@@ -131,9 +132,6 @@ class InsideScorer(object):
 
                     if rstate not in i_score[right_span]:
                         continue
-
-                    if span not in i_score:
-                        i_score[span] = {}
 
                     if pstate not in i_score[span]:
                         i_score[span][pstate] = {}
