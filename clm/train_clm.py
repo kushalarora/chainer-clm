@@ -26,9 +26,9 @@ parser.add_argument('--gpu', '-g', default=-1, type=int,
                     help='GPU ID (negative value indicates CPU)')
 parser.add_argument('--epoch', '-e', default=400, type=int,
                     help='number of epochs to learn')
-parser.add_argument('--unit', '-u', default=30, type=int,
+parser.add_argument('--unit', '-u', default=10, type=int,
                     help='number of units')
-parser.add_argument('--batchsize', '-b', type=int, default=10,
+parser.add_argument('--batchsize', '-b', type=int, default=20,
                     help='learning minibatch size')
 parser.add_argument('--label', '-l', type=int, default=5,
                     help='number of labels')
@@ -142,71 +142,89 @@ class RecursiveNet(chainer.Chain):
     def clear_z_leaf(self):
         self.z_leaf = 0
 
-def traverse(model, sent, start, end, sentence_grammar, Z, train=True):
+def traverse(model, sent, length, sentence_grammar, train=True):
     assert isinstance(sent, list)
-    span = (start, end)
 
-    print('Processing span: (%d-%d)' % span)
-    if len(sent[start:end]) == 1:
-        # leaf node
-        word = xp.array(sent[start:end], np.int32)
+    Z = {}
+    node_map = {}
+
+    # leaf nodes
+    for index in xrange(0, length):
+        span = (index, index + 1)
+        print('Processing index: (%d-%d)' % span)
+        word = xp.array([sent[index]], np.int32)
         loss = 0
         x = chainer.Variable(word, volatile=not train)
         node = model.leaf(x)
-        inside = model.leaf_unprob(node)/model.z_leaf
+
+        node_map[span] = node
 
         if span not in Z:
             Z[span] = {}
 
+        inside = model.leaf_unprob(node)/model.z_leaf
         for state, rule_dict in sentence_grammar[span].iteritems():
             for rule, theta in rule_dict.iteritems():
                 if state not in Z[span]:
                     Z[span][state] = 0
                 Z[span][state] += inside * theta
-    else:
-        # internal node
-        comp_z = 0
-        inside = 0
 
-        pstates = set([])
-        for split in xrange(start + 1, end):
-            left_span, right_span = ((start, split), (split, end))
-            left_node, right_node = (sent[start:split], sent[split:end])
+    # internal nodes
+    for diff in xrange(2, length + 1):
+        for start in xrange(0, length - diff + 1):
+            end = start + diff
 
-            left = traverse(model, sent, start, split, sentence_grammar, Z, train=train)
-            right = traverse(model, sent, split, end, sentence_grammar, Z, train=train)
+            span = (start, end)
+            print('Processing index: (%d-%d)' % span)
 
-            node = model.node(left, right)
+            comp_z = 0
+            pstates = set([])
 
-            prob_split = model.comp_unprob(node, left, right)
+            for split in xrange(start + 1, end):
+                left_span, right_span = ((start, split), (split, end))
+                left_node, right_node = (sent[start:split], sent[split:end])
 
-            comp_z += prob_split
+                left = node_map[left_span]
+                right = node_map[right_span]
 
-            if span not in Z:
-                Z[span] = {}
+                node = model.node(left, right)
 
-            for state, rule_dict in sentence_grammar[span].iteritems():
-                for rule, theta in rule_dict.iteritems():
-                    pstate, lstate, rstate = map(lambda a: int(a), rule.split())
+                node_map[span] = node
 
-                    if lstate not in Z[left_span]:
-                        continue
+                prob_split = model.comp_unprob(node, left, right)
 
-                    if rstate not in Z[right_span]:
-                        continue
+                comp_z += prob_split
 
-                    if pstate not in Z[span]:
-                        Z[span][pstate] = 0
+                if span not in Z:
+                    Z[span] = {}
 
-                    Z[span][pstate] += prob_split * theta * \
-                                                Z[left_span][lstate] * \
-                                                Z[right_span][rstate]
-                    pstates.add(pstate)
+                for state, rule_dict in sentence_grammar[span].iteritems():
+                    for rule, theta in rule_dict.iteritems():
+                        pstate, lstate, rstate = map(lambda a: int(a), rule.split())
 
-        for pstate in pstates:
-            Z[span][pstate] = Z[span][pstate]/comp_z
+                        if lstate not in Z[left_span]:
+                            continue
 
-    return node
+                        if rstate not in Z[right_span]:
+                            continue
+
+                        if pstate not in Z[span]:
+                            Z[span][pstate] = 0
+
+                        Z[span][pstate] += prob_split * theta * \
+                                                    Z[left_span][lstate] * \
+                                                    Z[right_span][rstate]
+                        pstates.add(pstate)
+
+            for pstate in pstates:
+                Z[span][pstate] = Z[span][pstate]/comp_z
+
+
+    prob_sent = 0
+    for prob in Z[(0, length)].values():
+        prob_sent += prob
+
+    return prob_sent
 
 def evaluate(model, test_sents):
     m = model.copy()
@@ -283,7 +301,7 @@ for epoch in range(n_epoch):
     total_loss = 0
     batch = 0
     cur_at = time.time()
-    # random.shuffle(train_sentences)
+    random.shuffle(train_sentences)
 
     model.init_z_leaf(True)
 
@@ -296,14 +314,10 @@ for epoch in range(n_epoch):
         Z = {}
         indexed_sentence = indexer.index(sentence)
 
-        v = traverse(model, indexed_sentence, 0, length,
-                     sentence_grammar, Z, train=True)
+        prob_sent = traverse(model, indexed_sentence, length, sentence_grammar, train=True)
 
         print('Processed sent#{}'.format(epoch_count))
 
-        prob_sent = 0
-        for prob in Z[(0, length)].values():
-            prob_sent += prob
 
         loss = -1 * F.log2(prob_sent)
         accum_loss += loss
@@ -327,16 +341,15 @@ for epoch in range(n_epoch):
             model.init_z_leaf(True)
 
     now = time.time()
-    throughput = float(len(train_sents)) / (now - cur_at)
+    throughput = float(train_size) / (now - cur_at)
     print('{:.2f} iters/sec, {:.2f} sec'.format(throughput, now - cur_at))
     print()
 
-    if (epoch + 1) % epoch_per_eval == 0:
+    if False and (epoch + 1) % epoch_per_eval == 0:
         print('Train data evaluation:')
         print(evaluate(model, train_sents))
         print('Develop data evaluation:')
         print(evaluate(model, valid_sents))
         print('')
-
 print('Test evaluateion')
-print(evaluate(model, test_sents))
+#print(evaluate(model, test_sents))
