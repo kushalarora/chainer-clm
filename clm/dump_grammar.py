@@ -3,6 +3,7 @@ from math import exp, log
 
 
 import argparse
+import shelve
 import math
 import os
 import pickle
@@ -23,7 +24,7 @@ class Word(object):
         return "(%d %s %d)" %(self.loc, self.word, self.signature)
 
 class InsideScorer(object):
-    def __init__(self, grammar):
+    def __init__(self, grammar, output_filename=None):
         self.grammar = grammar
         lexicalizedParser = getGrammar(grammar)
 
@@ -36,6 +37,7 @@ class InsideScorer(object):
         self.ug = lexicalizedParser.ug;
         self.lex = lexicalizedParser.lex;
         self.num_states = lexicalizedParser.stateIndex.size()
+        self.output_filename = output_filename
 
     def getToken(self, word, loc, lower_case=False):
         index = -1
@@ -63,59 +65,104 @@ class InsideScorer(object):
             if (lexScore > float('-inf')):
                 if span not in i_score:
                     i_score[span] = {}
-                i_score[span][state] = exp(lexScore)
+
+                if state not in i_score[span]:
+                    i_score[span][state] = {}
+
+                rule = '%s %s' % (state, index)
+                if rule not in i_score[span][state]:
+                    i_score[span][state][rule] = 0
+
+                i_score[span][state][rule] += exp(lexScore)
 
     def unaryScore(self, i_score, span):
-        for state in i_score.get(span, {}).keys():
-            is_val = log(i_score[span][state])
-
+        for state, rule_to_val in i_score[span].iteritems():
             for ur in self.ug.closedRulesByChild(state):
-                parentState = ur.parent()
+                pstate = ur.parent()
                 ps = ur.score()
-                i_score[span][parentState] = exp(is_val + ps)
 
+                if pstate not in i_score[span]:
+                    i_score[span][pstate] = {}
+
+                for rule, score  in rule_to_val.iteritems():
+                    rule_split = rule.split()
+                    rule_split[0] = str(pstate)
+                    rule = " ".join(rule_split)
+
+                    if rule not in i_score[span][pstate]:
+                        i_score[span][pstate][rule] = 0
+
+                    i_score[span][pstate][rule] += exp(log(score) + ps)
 
     def insideChartCell(self, i_score, start, diff):
         end = start + diff
         span = (start, end)
 
         for split in xrange(start + 1, end):
-            right_span = (start, split)
-            left_span = (split, end)
+            left_span = (start, split)
+            right_span = (split, end)
 
-            for rstate in i_score.get(right_span, {}).keys():
+            for rstate in i_score[right_span].keys():
                 for br in self.bg.splitRulesWithRC(rstate):
                     lstate = br.leftChild
                     pstate = br.parent()
                     rule_score = br.score()
 
-                    if lstate not in i_score.get(left_span, {}).keys():
+                    if lstate not in i_score[left_span]:
                         continue
 
                     if span not in i_score:
                         i_score[span] = {}
-                    i_score[span][pstate] = exp(rule_score)
 
-            for lstate in i_score.get(left_span, {}).keys():
+                    if pstate not in i_score[span]:
+                        i_score[span][pstate] = {}
+
+                    rule = '%s %s %s' % (pstate, lstate, rstate)
+                    if rule not in i_score[span][pstate]:
+                        i_score[span][pstate][rule] = 0
+
+                    i_score[span][pstate][rule] += exp(rule_score)
+
+            for lstate in i_score[left_span].keys():
                 for br in self.bg.splitRulesWithLC(lstate):
                     rstate = br.rightChild
                     pstate = br.parent()
                     rule_score = br.score()
 
-                    if rstate not in i_score.get(right_span, {}).keys():
+                    if rstate not in i_score[right_span]:
                         continue
 
                     if span not in i_score:
                         i_score[span] = {}
-                    i_score[span][pstate] = exp(rule_score)
+
+                    if pstate not in i_score[span]:
+                        i_score[span][pstate] = {}
+
+                    rule = '%s %s %s' % (pstate, lstate, rstate)
+                    if rule not in i_score[span][pstate]:
+                        i_score[span][pstate][rule] = 0
+
+                    i_score[span][pstate][rule] += exp(rule_score)
 
         # unary
         self.unaryScore(i_score, span)
 
     def calculateScore(self, input_filename, lower_case=False):
-        i_scores = {}
-        with open(input_filename) as f:
-            for sentence in f:
+
+        if self.output_filename is None:
+            self.output_filename = "%s.grammar" % input_filename
+
+        Grmr = shelve.open(self.output_filename)
+        with open(self.output_filename, 'w+') as fout:
+            # write out metadata
+            Grmr['metadata'] = {'version': 1.0,
+                                'input_filename': input_filename,
+                                'grammar': self.grammar,
+                                'num_states': self.num_states
+                                }
+
+        with open(input_filename) as fin:
+            for sentence in fin:
                 sentence = sentence.strip()
                 print "Processing Sentence: '%s'" % sentence
 
@@ -124,7 +171,8 @@ class InsideScorer(object):
                 length = len(words)
 
                 i_score = {}
-                for word in [Word(i, word, self.getToken(word, i, lower_case)) for i, word in enumerate(words)]:
+                for word in [Word(i, word, self.getToken(word, i, lower_case)) \
+                                for i, word in enumerate(words)]:
                     start = word.loc
                     end = start + 1
                     span = (start, end)
@@ -142,19 +190,21 @@ class InsideScorer(object):
                         self.insideChartCell(i_score, start, diff)
 
                 print "Done computing inside score"
-                i_scores[sentence] = i_score
-            return i_scores
+
+                Grmr[sentence] = i_score
+                Grmr.sync()
+
+        Grmr.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_filename', '-f', type=str, help='input file for calculating iscores')
     parser.add_argument('--grammar', '-g', type=str, default='englishPCFG', help='Stanford Grammar file')
-    parser.add_argument('--output_filename', '-o', type=str, help='Pickled i_scores', default='data/grammar.p')
+    parser.add_argument('--output_filename', '-o', type=str, help='Pickled i_scores')
     parser.add_argument('--lower_case', help='lowercase input', action='store_true')
     parser.set_defaults(lower_case=False)
 
     args = parser.parse_args()
-    iscorer = InsideScorer(args.grammar)
-    i_scores = iscorer.calculateScore(args.input_filename, args.lower_case)
 
-    pickle.dump(i_scores, open(args.output_filename, 'wb'))
+    iscorer = InsideScorer(args.grammar, args.output_filename)
+    i_scores = iscorer.calculateScore(args.input_filename, args.lower_case)

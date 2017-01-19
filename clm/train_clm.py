@@ -5,8 +5,10 @@
 import argparse
 import codecs
 import collections
+import os
 import random
 import re
+import shelve
 import time
 
 import numpy as np
@@ -14,10 +16,9 @@ import numpy as np
 import chainer
 from chainer import cuda
 import chainer.functions as F
-from chainer.functions.math import sum
 import chainer.links as L
 from chainer import optimizers
-from datasets import build_vocab, index_data
+from datasets import Indexer
 
 
 parser = argparse.ArgumentParser()
@@ -33,6 +34,9 @@ parser.add_argument('--label', '-l', type=int, default=5,
                     help='number of labels')
 parser.add_argument('--epocheval', '-p', type=int, default=5,
                     help='number of epochs per evaluation')
+parser.add_argument('--grammar_filename', '-gp', type=str,
+                    help='grammar object by running dump_grammar.py')
+
 parser.add_argument('--test', dest='test', action='store_true')
 parser.set_defaults(test=False)
 args = parser.parse_args()
@@ -46,6 +50,10 @@ batchsize = args.batchsize      # minibatch size
 n_label = args.label         # number of labels
 epoch_per_eval = args.epocheval  # number of epochs per evaluation
 
+# Get preprocessed Grammar
+grammar = None
+if os.path.exists(args.grammar_filename):
+    grammar = shelve.open(args.grammar_filename)
 
 class SexpParser(object):
 
@@ -134,8 +142,11 @@ class RecursiveNet(chainer.Chain):
     def clear_z_leaf(self):
         self.z_leaf = 0
 
-def traverse(model, sent, start, end, train=True):
+def traverse(model, sent, start, end, sentence_grammar, Z, train=True):
     assert isinstance(sent, list)
+    span = (start, end)
+
+    print('Processing span: (%d-%d)' % span)
     if len(sent[start:end]) == 1:
         # leaf node
         word = xp.array(sent[start:end], np.int32)
@@ -143,17 +154,27 @@ def traverse(model, sent, start, end, train=True):
         x = chainer.Variable(word, volatile=not train)
         node = model.leaf(x)
         inside = model.leaf_unprob(node)/model.z_leaf
+
+        if span not in Z:
+            Z[span] = {}
+
+        for state, rule_dict in sentence_grammar[span].iteritems():
+            for rule, theta in rule_dict.iteritems():
+                if state not in Z[span]:
+                    Z[span][state] = 0
+                Z[span][state] += inside * theta
     else:
         # internal node
         comp_z = 0
         inside = 0
-        for split in xrange(start + 1, end):
-            left_node, right_node = (sent[start:split], sent[split:end])
-            left_inside, left = traverse(
-                model, sent, start, split, train=train)
 
-            right_inside, right = traverse(
-                model, sent, split, end, train=train)
+        pstates = set([])
+        for split in xrange(start + 1, end):
+            left_span, right_span = ((start, split), (split, end))
+            left_node, right_node = (sent[start:split], sent[split:end])
+
+            left = traverse(model, sent, start, split, sentence_grammar, Z, train=train)
+            right = traverse(model, sent, split, end, sentence_grammar, Z, train=train)
 
             node = model.node(left, right)
 
@@ -161,11 +182,31 @@ def traverse(model, sent, start, end, train=True):
 
             comp_z += prob_split
 
-            inside += right_inside * left_inside * prob_split
+            if span not in Z:
+                Z[span] = {}
 
-        inside = inside/comp_z
+            for state, rule_dict in sentence_grammar[span].iteritems():
+                for rule, theta in rule_dict.iteritems():
+                    pstate, lstate, rstate = map(lambda a: int(a), rule.split())
 
-    return inside, node
+                    if lstate not in Z[left_span]:
+                        continue
+
+                    if rstate not in Z[right_span]:
+                        continue
+
+                    if pstate not in Z[span]:
+                        Z[span][pstate] = 0
+
+                    Z[span][pstate] += prob_split * theta * \
+                                                Z[left_span][lstate] * \
+                                                Z[right_span][rstate]
+                    pstates.add(pstate)
+
+        for pstate in pstates:
+            Z[span][pstate] = Z[span][pstate]/comp_z
+
+    return node
 
 def evaluate(model, test_sents):
     m = model.copy()
@@ -187,23 +228,17 @@ else:
     max_size = None
 
 
-dataset_train='../data/train10'
-dataset_valid='../data/valid10'
-dataset_test='../data/valid10'
+dataset_train='./data/train10'
+dataset_valid='./data/valid10'
+dataset_test='./data/valid10'
 
-train_sents, vocab, vocab_index = build_vocab(dataset_train)
-valid_sents = index_data(dataset_valid, vocab_index)
-test_sents = index_data(dataset_test, vocab_index)
+indexer = Indexer(dataset_train)
+indexer.build_vocab()
 
+vocab = indexer.get_vocab()
 n_vocab = len(vocab)
 
-print('Vocab size: {}'.format(len(vocab)))
-print('Training dataset size: {}'.format(len(train_sents)))
-print('Valid dataset size: {}'.format(len(valid_sents)))
-print('Test dataset size: {}'.format(len(test_sents)))
-
 model = RecursiveNet(n_vocab, n_units)
-
 
 if args.gpu >= 0:
     model.to_gpu()
@@ -217,20 +252,59 @@ accum_loss = 0
 batch_count = 0
 start_at = time.time()
 cur_at = start_at
+
+metadata = grammar['metadata']
+num_states = metadata['num_states']
+
+print('Vocab size: {}'.format(n_vocab))
+
+train_size = 0
+with open(dataset_train) as f:
+    train_sentences = f.readlines()
+    train_size += len(train_sentences)
+
+test_size = 0
+with open(dataset_test) as f:
+    test_sentences = f.readlines()
+    test_size += len(test_sentences)
+
+valid_size = 0
+with open(dataset_valid) as f:
+    valid_sentences = f.readlines()
+    valid_size += len(valid_sentences)
+
+print('Training dataset size: {}'.format(train_size))
+print('Valid dataset size: {}'.format(valid_size))
+print('Test dataset size: {}'.format(test_size))
+
 for epoch in range(n_epoch):
     print('Epoch: {0:d}'.format(epoch))
     epoch_count = 0
     total_loss = 0
     batch = 0
     cur_at = time.time()
-    random.shuffle(train_sents)
+    # random.shuffle(train_sentences)
 
     model.init_z_leaf(True)
 
-    for sent in train_sents:
-        print('Processing sent#{}. len={}'.format(epoch_count, len(sent)))
-        prob_sent, v = traverse(model, sent, 0, len(sent), train=True)
+    for i, sentence in enumerate(train_sentences):
+        sentence = sentence.strip()
+        length = len(sentence.split())
+        print('Processing sentence#{}. len={}'.format(i, length))
+        sentence_grammar = grammar[sentence]
+
+        Z = {}
+        indexed_sentence = indexer.index(sentence)
+
+        v = traverse(model, indexed_sentence, 0, length,
+                     sentence_grammar, Z, train=True)
+
         print('Processed sent#{}'.format(epoch_count))
+
+        prob_sent = 0
+        for prob in Z[(0, length)].values():
+            prob_sent += prob
+
         loss = -1 * F.log2(prob_sent)
         accum_loss += loss
         epoch_count += 1

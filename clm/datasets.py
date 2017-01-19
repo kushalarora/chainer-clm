@@ -1,46 +1,37 @@
 import numpy as np
 
+class Indexer(object):
+    def __init__(self, input_filename):
+        self.input_filename = input_filename
 
-def build_vocab(filename):
-    vocab = [None]
-    vocab_dict = {None: 0}
-    S = []
-    fin = open(filename)
-    if fin is None:
-        raise IOError("Filename %s not found" % filename)
+    def build_vocab(self):
+        self.vocab = [None]
+        self.vocab_dict = {None: 0}
+        fin = open(self.input_filename)
+        if fin is None:
+            raise IOError("Filename %s not found" % filename)
 
-    index = 1
-    for line in fin:
-        words = line.split()
-        sentence = []
-        for i, word in enumerate(words):
-            if word not in vocab_dict:
-                vocab_dict[word] = index
-                vocab.append(word)
-                index += 1
-            idx = vocab_dict[word]
-            sentence.append(idx)
-        S.append(sentence)
-    return (S, vocab, vocab_dict)
+        index = 1
+        for line in fin:
+            words = line.split()
+            for i, word in enumerate(words):
+                if word not in self.vocab_dict:
+                    self.vocab_dict[word] = index
+                    self.vocab.append(word)
+                    index += 1
 
+    def get_vocab(self):
+        return self.vocab
 
-def index_data(filename, Vindex):
-    fin = open(filename)
-    if fin is None:
-        raise IOError("Filename %s not found" % filename)
+    def index(self, sentence):
+        if self.vocab_dict is None:
+            raise BaseException("No vocabulary found. Call build_vocab method first.")
 
-    if Vindex is None:
-        raise BaseException("Vocab index not found")
-
-    S = []
-    for line in fin:
-
-        words = line.split()
-        sentence = []
-
+        indexes = []
+        words = sentence.split()
         for word in words:
             try:
-                id = Vindex[word]
+                id = self.vocab_dict[word]
             except KeyError:
                 word = None
                 id = 0;
@@ -49,8 +40,5 @@ def index_data(filename, Vindex):
                 raise RuntimeError(
                     "Word: %s missing in vocabulary" % word)
 
-            sentence.append(id)
-
-        S.append(sentence)
-
-    return S
+            indexes.append(id)
+        return indexes
