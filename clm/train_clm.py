@@ -7,6 +7,7 @@ import codecs
 import collections
 import os
 import random
+import hashlib
 import re
 import shelve
 import time
@@ -26,19 +27,19 @@ parser.add_argument('--gpu', '-g', default=-1, type=int,
                     help='GPU ID (negative value indicates CPU)')
 parser.add_argument('--epoch', '-e', default=400, type=int,
                     help='number of epochs to learn')
-parser.add_argument('--unit', '-u', default=10, type=int,
+parser.add_argument('--unit', '-u', default=100, type=int,
                     help='number of units')
 parser.add_argument('--batchsize', '-b', type=int, default=20,
                     help='learning minibatch size')
-parser.add_argument('--label', '-l', type=int, default=5,
-                    help='number of labels')
 parser.add_argument('--epocheval', '-p', type=int, default=5,
                     help='number of epochs per evaluation')
-parser.add_argument('--grammar_filename', '-gp', type=str,
+parser.add_argument('--grammar-filename', '-G', type=str,
                     help='grammar object by running dump_grammar.py')
-
+parser.add_argument('--learning-rate', '-l', type=float, default=0.01,
+                    help='Learning rate value.')
 parser.add_argument('--test', dest='test', action='store_true')
 parser.set_defaults(test=False)
+
 args = parser.parse_args()
 if args.gpu >= 0:
     cuda.check_cuda_available()
@@ -47,66 +48,12 @@ xp = cuda.cupy if args.gpu >= 0 else np
 n_epoch = args.epoch       # number of epochs
 n_units = args.unit        # number of units per layer
 batchsize = args.batchsize      # minibatch size
-n_label = args.label         # number of labels
 epoch_per_eval = args.epocheval  # number of epochs per evaluation
+learning_rate = args.learning_rate
+
 
 # Get preprocessed Grammar
-grammar = None
-if os.path.exists(args.grammar_filename):
-    grammar = shelve.open(args.grammar_filename)
-
-class SexpParser(object):
-
-    def __init__(self, line):
-        self.tokens = re.findall(r'\(|\)|[^\(\) ]+', line)
-        self.pos = 0
-
-    def parse(self):
-        assert self.pos < len(self.tokens)
-        token = self.tokens[self.pos]
-        assert token != ')'
-        self.pos += 1
-
-        if token == '(':
-            children = []
-            while True:
-                assert self.pos < len(self.tokens)
-                if self.tokens[self.pos] == ')':
-                    self.pos += 1
-                    break
-                else:
-                    children.append(self.parse())
-            return children
-        else:
-            return token
-
-
-def convert_tree(vocab, exp):
-    assert isinstance(exp, list) and (len(exp) == 2 or len(exp) == 3)
-
-    if len(exp) == 2:
-        label, leaf = exp
-        if leaf not in vocab:
-            vocab[leaf] = len(vocab)
-        return {'label': int(label), 'node': vocab[leaf]}
-    elif len(exp) == 3:
-        label, left, right = exp
-        node = (convert_tree(vocab, left), convert_tree(vocab, right))
-        return {'label': int(label), 'node': node}
-
-
-def read_corpus(path, vocab, max_size):
-    with codecs.open(path, encoding='utf-8') as f:
-        trees = []
-        for line in f:
-            line = line.strip()
-            tree = SexpParser(line).parse()
-            trees.append(convert_tree(vocab, tree))
-            if max_size and len(trees) >= max_size:
-                break
-
-        return trees
-
+grammar = shelve.open(args.grammar_filename)
 
 class RecursiveNet(chainer.Chain):
 
@@ -142,6 +89,8 @@ class RecursiveNet(chainer.Chain):
     def clear_z_leaf(self):
         self.z_leaf = 0
 
+Z_vocab = sum(grammar['vocab'].values())
+
 def traverse(model, sent, length, sentence_grammar, train=True):
     assert isinstance(sent, list)
 
@@ -151,6 +100,8 @@ def traverse(model, sent, length, sentence_grammar, train=True):
     # leaf nodes
     for index in xrange(0, length):
         span = (index, index + 1)
+        split = index
+
         print('Processing index: (%d-%d)' % span)
         word = xp.array([sent[index]], np.int32)
         loss = 0
@@ -159,15 +110,13 @@ def traverse(model, sent, length, sentence_grammar, train=True):
 
         node_map[span] = node
 
-        if span not in Z:
-            Z[span] = {}
-
         inside = model.leaf_unprob(node)/model.z_leaf
-        for state, rule_dict in sentence_grammar[span].iteritems():
-            for rule, theta in rule_dict.iteritems():
-                if state not in Z[span]:
-                    Z[span][state] = 0
-                Z[span][state] += inside * theta
+
+        if span not in Z:
+            Z[span] = 0
+
+        Z[span] += inside * (sentence_grammar[span][split]/Z_vocab)
+        print('Inside Score: %f' % Z[span].data)
 
     # internal nodes
     for diff in xrange(2, length + 1):
@@ -178,7 +127,9 @@ def traverse(model, sent, length, sentence_grammar, train=True):
             print('Processing index: (%d-%d)' % span)
 
             comp_z = 0
-            pstates = set([])
+
+            if span not in Z:
+                Z[span] = 0
 
             for split in xrange(start + 1, end):
                 left_span, right_span = ((start, split), (split, end))
@@ -195,36 +146,15 @@ def traverse(model, sent, length, sentence_grammar, train=True):
 
                 comp_z += prob_split
 
-                if span not in Z:
-                    Z[span] = {}
+                Z_split = prob_split * Z[left_span] * Z[right_span] *  sentence_grammar[span][split]
+                print('Inside Score: Split:%d::%f' % (split, Z_split.data))
+                Z[span] += Z_split
 
-                for state, rule_dict in sentence_grammar[span].iteritems():
-                    for rule, theta in rule_dict.iteritems():
-                        pstate, lstate, rstate = map(lambda a: int(a), rule.split())
+            for split in xrange(start + 1, end):
+                Z[span] = Z[span]/comp_z
+            print('Inside Score: %f' % Z[span].data)
 
-                        if lstate not in Z[left_span]:
-                            continue
-
-                        if rstate not in Z[right_span]:
-                            continue
-
-                        if pstate not in Z[span]:
-                            Z[span][pstate] = 0
-
-                        Z[span][pstate] += prob_split * theta * \
-                                                    Z[left_span][lstate] * \
-                                                    Z[right_span][rstate]
-                        pstates.add(pstate)
-
-            for pstate in pstates:
-                Z[span][pstate] = Z[span][pstate]/comp_z
-
-
-    prob_sent = 0
-    for prob in Z[(0, length)].values():
-        prob_sent += prob
-
-    return prob_sent
+    return Z[(0, length)]
 
 def evaluate(model, test_sents):
     m = model.copy()
@@ -262,9 +192,9 @@ if args.gpu >= 0:
     model.to_gpu()
 
 # Setup optimizer
-optimizer = optimizers.AdaGrad(lr=0.1)
+optimizer = optimizers.AdaGrad(lr=learning_rate)
 optimizer.setup(model)
-optimizer.add_hook(chainer.optimizer.WeightDecay(0.001))
+optimizer.add_hook(chainer.optimizer.WeightDecay(0.01))
 
 accum_loss = 0
 batch_count = 0
@@ -295,23 +225,24 @@ print('Training dataset size: {}'.format(train_size))
 print('Valid dataset size: {}'.format(valid_size))
 print('Test dataset size: {}'.format(test_size))
 
+import pdb;pdb.set_trace()
 for epoch in range(n_epoch):
     print('Epoch: {0:d}'.format(epoch))
     epoch_count = 0
     total_loss = 0
     batch = 0
     cur_at = time.time()
-    random.shuffle(train_sentences)
+#    random.shuffle(train_sentences)
 
     model.init_z_leaf(True)
-
     for i, sentence in enumerate(train_sentences):
         sentence = sentence.strip()
         length = len(sentence.split())
-        print('Processing sentence#{}. len={}'.format(i, length))
-        sentence_grammar = grammar[sentence]
+        print('Processing sentence#{}:{}::{}'.format(i, length, sentence))
 
-        Z = {}
+        hash = hashlib.md5(sentence).hexdigest()
+        sentence_grammar = grammar[hash]
+
         indexed_sentence = indexer.index(sentence)
 
         prob_sent = traverse(model, indexed_sentence, length, sentence_grammar, train=True)

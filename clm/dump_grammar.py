@@ -7,6 +7,7 @@ import shelve
 import math
 import os
 import pickle
+import hashlib
 
 def getGrammar(grammar):
     dirname = os.path.dirname(os.path.realpath(__file__))
@@ -54,9 +55,18 @@ class InsideScorer(object):
                     signature = self.lex.getUnknownWordModel().getSignature(word, loc)
         return signature
 
-    def lexScore(self, i_score, rule_dict, word, start, span):
+    def lexScore(self, i_score, span_split_score, vocab_scores, word, start, span):
+
+        span_split_state_score = {}
         if span not in i_score:
             i_score[span] = {}
+            span_split_score[span] = {}
+            span_split_state_score[span] = {}
+
+        split = span[0]
+        if split not in span_split_score[span]:
+            span_split_score[span][split] = 0
+            span_split_state_score[span][split] = {}
 
         index = self.wordIndex.indexOf(word.signature)
         tagIter = self.lex.ruleIteratorByWord(index, start, None)
@@ -66,49 +76,59 @@ class InsideScorer(object):
             lexScore = self.lex.score(tag, start, word.signature, None)
 
             if (lexScore > float('-inf')):
-
                 if state not in i_score[span]:
-                    i_score[span][state] = set([])
+                    i_score[span][state] = 0
 
-                rule = '%s %s' % (state, index)
-                i_score[span][state].add(rule)
+                if state not in span_split_state_score[span][split]:
+                    span_split_state_score[span][split][state] = 0
 
-                if rule not in rule_dict:
-                    rule_dict[rule] = exp(lexScore)
+                score = exp(lexScore)
+                i_score[span][state] += score
+                span_split_score[span][split] += score
+                span_split_state_score[span][split][state] += score
 
-    def unaryScore(self, i_score, rule_dict, span):
-        for state, rule_set in i_score[span].iteritems():
+        # unary
+        self.unaryScore(span, split, i_score, span_split_score, span_split_state_score)
+
+        if word.word not in vocab_scores:
+            vocab_scores[word.word] = span_split_score[span][split]
+
+    def unaryScore(self, span, split, i_score, span_split_score, span_split_state_score):
+        state_list = span_split_state_score[span][split].keys()
+        for state in state_list:
             for ur in self.ug.closedRulesByChild(state):
                 pstate = ur.parent()
                 ps = ur.score()
 
                 if pstate not in i_score[span]:
-                    i_score[span][pstate] = set([])
+                    i_score[span][pstate] = 0
 
-                for rule in rule_set:
-                    score = rule_dict[rule]
+                split_score = log(span_split_state_score[span][split][state])
+                state_score = log(i_score[span][state])
 
-                    rule_split = rule.split()
-                    rule_split[0] = str(pstate)
-                    new_rule = " ".join(rule_split)
+                span_split_score[span][split] += exp(split_score + ps)
+                i_score[span][pstate] += exp(state_score + ps)
 
-                    i_score[span][pstate].add(new_rule)
-
-                    if new_rule not in rule_dict:
-                        rule_dict[new_rule] = exp(log(score) + ps)
-
-    def insideChartCell(self, i_score, rule_dict, start, diff):
+    def insideChartCell(self, start, diff, i_score, span_split_score):
         end = start + diff
         span = (start, end)
 
+        span_split_state_score = {}
         if span not in i_score:
             i_score[span] = {}
+            span_split_score[span] = {}
+            span_split_state_score[span] = {}
 
         for split in xrange(start + 1, end):
+            if split not in span_split_score:
+                span_split_score[span][split] = 0
+                span_split_state_score[span][split] = {}
+
             left_span = (start, split)
             right_span = (split, end)
 
-            for rstate in i_score[right_span].keys():
+            state_list = i_score[right_span].keys()
+            for rstate in state_list:
                 for br in self.bg.splitRulesWithRC(rstate):
                     lstate = br.leftChild
                     pstate = br.parent()
@@ -118,15 +138,20 @@ class InsideScorer(object):
                         continue
 
                     if pstate not in i_score[span]:
-                        i_score[span][pstate] = set([])
+                        i_score[span][pstate] = 0
 
-                    rule = '%s %s %s' % (pstate, lstate, rstate)
-                    i_score[span][pstate].add(rule)
+                    if pstate not in span_split_state_score[span][split]:
+                        span_split_state_score[span][split][pstate] = 0
 
-                    if rule not in rule_dict:
-                        rule_dict[rule] = exp(rule_score)
+                    score = exp(rule_score +
+                                log(i_score[left_span][lstate]) +
+                                log(i_score[right_span][rstate]))
+                    span_split_score[span][split] += score
+                    span_split_state_score[span][split][pstate] += score
+                    i_score[span][pstate] += score
 
-            for lstate in i_score[left_span].keys():
+            state_list = i_score[left_span].keys()
+            for lstate in state_list:
                 for br in self.bg.splitRulesWithLC(lstate):
                     rstate = br.rightChild
                     pstate = br.parent()
@@ -136,16 +161,27 @@ class InsideScorer(object):
                         continue
 
                     if pstate not in i_score[span]:
-                        i_score[span][pstate] = set([])
+                        i_score[span][pstate] = 0
 
-                    rule = '%s %s %s' % (pstate, lstate, rstate)
-                    i_score[span][pstate].add(rule)
+                    if pstate not in span_split_state_score[span][split]:
+                        span_split_state_score[span][split][pstate] = 0
 
-                    if rule not in rule_dict:
-                        rule_dict[rule] = exp(rule_score)
+                    score = exp(rule_score +
+                                log(i_score[left_span][lstate]) +
+                                log(i_score[right_span][rstate]))
+                    span_split_score[span][split] += score
+                    span_split_state_score[span][split][pstate] += score
+                    i_score[span][pstate] += score
 
-        # unary
-        self.unaryScore(i_score, rule_dict, span)
+            # unary
+            self.unaryScore(span, split, i_score, span_split_score, span_split_state_score)
+
+        z_split = sum(span_split_score[span].values())
+        if z_split == 0:
+            return
+
+        for split in span_split_score[span]:
+            span_split_score[span][split] /= z_split
 
     def calculateScore(self, input_filename, lower_case=False):
 
@@ -154,24 +190,29 @@ class InsideScorer(object):
 
         Grmr = shelve.open(self.output_filename)
         Grmr.clear()
-        with open(self.output_filename, 'w+') as fout:
-            # write out metadata
-            Grmr['metadata'] = {'version': 1.0,
-                                'input_filename': input_filename,
-                                'grammar': self.grammar,
-                                'num_states': self.num_states
-                                }
-            Grmr['rules'] = {}
+
+        # write out metadata
+        Grmr['metadata'] = {'version': 1.0,
+                            'input_filename': input_filename,
+                            'grammar': self.grammar,
+                            'num_states': self.num_states
+                            }
+        Grmr['scores'] = {}
+        Grmr['vocab'] = {}
+        sent_count = 0
         with open(input_filename) as fin:
-            rule_dict = Grmr['rules']
+            score_dict = Grmr['scores']
+            vocab_scores = Grmr['vocab']
             for sentence in fin:
                 sentence = sentence.strip()
-                print "Processing Sentence: '%s'" % sentence
+                print "Processing Sentence(%d): '%s'" % (sent_count, sentence)
+                sent_count += 1
 
                 print "Computing Lex Score"
                 words = sentence.split()
                 length = len(words)
 
+                span_split_score = {}
                 i_score = {}
                 for word in [Word(i, word, self.getToken(word, i, lower_case)) \
                                 for i, word in enumerate(words)]:
@@ -180,22 +221,21 @@ class InsideScorer(object):
                     span = (start, end)
 
                     # Lex Score
-                    self.lexScore(i_score, rule_dict, word, start, span)
-
-                    # unary
-                    self.unaryScore(i_score, rule_dict, span)
+                    self.lexScore(i_score, span_split_score, vocab_scores, word, start, span)
 
                 print "Computing inside score"
                 for diff in xrange(2, length + 1):
                     print "Compute inside score for span size: %d" % diff
                     for start in xrange(0, length - diff + 1):
-                        self.insideChartCell(i_score, rule_dict, start, diff)
+                        self.insideChartCell(start, diff, i_score, span_split_score)
 
                 print "Done computing inside score"
 
-                Grmr[sentence] = i_score
-                Grmr.sync()
+                hash = hashlib.md5(sentence).hexdigest()
+                Grmr[hash] = span_split_score
 
+                Grmr.sync()
+            Grmr['vocab'] = vocab_scores
         Grmr.close()
 
 if __name__ == '__main__':
