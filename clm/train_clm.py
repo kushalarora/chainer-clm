@@ -37,6 +37,8 @@ parser.add_argument('--grammar-filename', '-G', type=str,
                     help='grammar object by running dump_grammar.py')
 parser.add_argument('--learning-rate', '-l', type=float, default=0.01,
                     help='Learning rate value.')
+parser.add_argument('--l2_reg', '-L', type=float, default=0.01,
+                    help='L2 regularization coeff.')
 parser.add_argument('--test', dest='test', action='store_true')
 parser.set_defaults(test=False)
 
@@ -50,6 +52,7 @@ n_units = args.unit        # number of units per layer
 batchsize = args.batchsize      # minibatch size
 epoch_per_eval = args.epocheval  # number of epochs per evaluation
 learning_rate = args.learning_rate
+l2_reg = args.l2_reg
 
 
 # Get preprocessed Grammar
@@ -89,8 +92,6 @@ class RecursiveNet(chainer.Chain):
     def clear_z_leaf(self):
         self.z_leaf = 0
 
-Z_vocab = sum(grammar['vocab'].values())
-
 def traverse(model, sent, length, sentence_grammar, train=True):
     assert isinstance(sent, list)
 
@@ -102,30 +103,18 @@ def traverse(model, sent, length, sentence_grammar, train=True):
         span = (index, index + 1)
         split = index
 
-        print('Processing index: (%d-%d)' % span)
         word = xp.array([sent[index]], np.int32)
         loss = 0
         x = chainer.Variable(word, volatile=not train)
         node = model.leaf(x)
-
         node_map[span] = node
-
-        inside = model.leaf_unprob(node)/model.z_leaf
-
-        if span not in Z:
-            Z[span] = 0
-
-        Z[span] += inside * (sentence_grammar[span][split]/Z_vocab)
-        print('Inside Score: %f' % Z[span].data)
+        Z[span] = model.leaf_unprob(node)/model.z_leaf
 
     # internal nodes
     for diff in xrange(2, length + 1):
         for start in xrange(0, length - diff + 1):
             end = start + diff
-
             span = (start, end)
-            print('Processing index: (%d-%d)' % span)
-
             comp_z = 0
 
             if span not in Z:
@@ -139,20 +128,14 @@ def traverse(model, sent, length, sentence_grammar, train=True):
                 right = node_map[right_span]
 
                 node = model.node(left, right)
-
-                node_map[span] = node
-
                 prob_split = model.comp_unprob(node, left, right)
-
+                Z_split = prob_split * Z[left_span] * Z[right_span] *  sentence_grammar[span][split]
+                node_map[span] = Z_split.data * node
+                Z[span] += Z_split
                 comp_z += prob_split
 
-                Z_split = prob_split * Z[left_span] * Z[right_span] *  sentence_grammar[span][split]
-                print('Inside Score: Split:%d::%f' % (split, Z_split.data))
-                Z[span] += Z_split
-
-            for split in xrange(start + 1, end):
-                Z[span] = Z[span]/comp_z
-            print('Inside Score: %f' % Z[span].data)
+            node_map[span] /= Z[span].data
+            Z[span] /= comp_z
 
     return Z[(0, length)]
 
@@ -163,11 +146,15 @@ def evaluate(model, test_sents):
     m.volatile = True
     result = collections.defaultdict(lambda: 0)
     entropy = 0
-    for sent in test_sents:
-        inside, node = traverse(m, sent, 0, len(sent), train=False)
-        entropy += -F.log2(inside).data
+    for sentence in test_sents:
+        sentence = sentence.strip()
+        hash = hashlib.md5(sentence).hexdigest()
+        sentence_grammar = grammar[hash]
+        indexed_sentence = indexer.index(sentence)
+        prob_sent = traverse(m, indexed_sentence, len(indexed_sentence), sentence_grammar, train=False)
+        entropy += -F.log2(prob_sent)
 
-    return entropy/len(test_sents)
+    return entropy.data/n_vocab
 
 #vocab = {}
 if args.test:
@@ -177,24 +164,24 @@ else:
 
 
 dataset_train='./data/train10'
-dataset_valid='./data/valid10'
-dataset_test='./data/valid10'
+dataset_valid='./data/train10'
+dataset_test='./data/train10'
 
 indexer = Indexer(dataset_train)
 indexer.build_vocab()
 
 vocab = indexer.get_vocab()
 n_vocab = len(vocab)
-
+Z_vocab = sum([grammar['vocab'][word] for word in vocab[1:]])
 model = RecursiveNet(n_vocab, n_units)
 
 if args.gpu >= 0:
     model.to_gpu()
 
 # Setup optimizer
-optimizer = optimizers.AdaGrad(lr=learning_rate)
+optimizer = optimizers.MomentumSGD(lr=learning_rate)
 optimizer.setup(model)
-optimizer.add_hook(chainer.optimizer.WeightDecay(0.01))
+optimizer.add_hook(chainer.optimizer.WeightDecay(l2_reg))
 
 accum_loss = 0
 batch_count = 0
@@ -225,14 +212,13 @@ print('Training dataset size: {}'.format(train_size))
 print('Valid dataset size: {}'.format(valid_size))
 print('Test dataset size: {}'.format(test_size))
 
-import pdb;pdb.set_trace()
 for epoch in range(n_epoch):
     print('Epoch: {0:d}'.format(epoch))
     epoch_count = 0
     total_loss = 0
     batch = 0
     cur_at = time.time()
-#    random.shuffle(train_sentences)
+    random.shuffle(train_sentences)
 
     model.init_z_leaf(True)
     for i, sentence in enumerate(train_sentences):
@@ -242,7 +228,6 @@ for epoch in range(n_epoch):
 
         hash = hashlib.md5(sentence).hexdigest()
         sentence_grammar = grammar[hash]
-
         indexed_sentence = indexer.index(sentence)
 
         prob_sent = traverse(model, indexed_sentence, length, sentence_grammar, train=True)
@@ -258,7 +243,7 @@ for epoch in range(n_epoch):
         if batch_count >= batchsize:
             print('Updating batch gradient for batch: {}'.format(batch))
             batch += 1
-            total_loss += float(accum_loss.data)
+            total_loss += float(accum_loss.data)/n_vocab
             accum_loss /= batch_count
             model.cleargrads()
             accum_loss.backward()
@@ -267,7 +252,8 @@ for epoch in range(n_epoch):
             accum_loss = 0
             batch_count = 0
 
-            print('loss: {:.2f}'.format(total_loss/epoch_count))
+            print('loss: {:.5f}'.format(total_loss))
+            print('Validation loss: {:.5f}'.format(float(evaluate(model, valid_sentences))))
             model.clear_z_leaf()
             model.init_z_leaf(True)
 
@@ -283,4 +269,4 @@ for epoch in range(n_epoch):
         print(evaluate(model, valid_sents))
         print('')
 print('Test evaluateion')
-#print(evaluate(model, test_sents))
+print('Test loss: {:.5f}'.format(float(evaluate(model, test_sentences))))
