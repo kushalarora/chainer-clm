@@ -54,7 +54,7 @@ epoch_per_eval = args.epocheval  # number of epochs per evaluation
 learning_rate = args.learning_rate
 l2_reg = args.l2_reg
 
-
+chainer.set_debug(True)
 # Get preprocessed Grammar
 grammar = shelve.open(args.grammar_filename)
 
@@ -108,7 +108,7 @@ def traverse(model, sent, length, sentence_grammar, train=True):
         x = chainer.Variable(word, volatile=not train)
         node = model.leaf(x)
         node_map[span] = node
-        Z[span] = model.leaf_unprob(node)/model.z_leaf
+        Z[span] = model.leaf_unprob(node)
 
     # internal nodes
     for diff in xrange(2, length + 1):
@@ -120,6 +120,7 @@ def traverse(model, sent, length, sentence_grammar, train=True):
             if span not in Z:
                 Z[span] = 0
 
+            #print('span: %d, %d' % span)
             for split in xrange(start + 1, end):
                 left_span, right_span = ((start, split), (split, end))
                 left_node, right_node = (sent[start:split], sent[split:end])
@@ -134,10 +135,12 @@ def traverse(model, sent, length, sentence_grammar, train=True):
                 Z[span] += Z_split
                 comp_z += prob_split
 
-            node_map[span] /= Z[span].data
+            if Z[span].data > 0:
+                node_map[span] /= Z[span].data
+
             Z[span] /= comp_z
 
-    return Z[(0, length)]
+    return -F.log2(Z[(0, length)]) + length * F.log2(model.z_leaf)
 
 def evaluate(model, test_sents):
     m = model.copy()
@@ -151,10 +154,9 @@ def evaluate(model, test_sents):
         hash = hashlib.md5(sentence).hexdigest()
         sentence_grammar = grammar[hash]
         indexed_sentence = indexer.index(sentence)
-        prob_sent = traverse(m, indexed_sentence, len(indexed_sentence), sentence_grammar, train=False)
-        entropy += -F.log2(prob_sent)
+        entropy += traverse(m, indexed_sentence, len(indexed_sentence), sentence_grammar, train=False)
 
-    return entropy.data/n_vocab
+    return entropy.data
 
 #vocab = {}
 if args.test:
@@ -163,9 +165,13 @@ else:
     max_size = None
 
 
-dataset_train='./data/train10'
-dataset_valid='./data/train10'
-dataset_test='./data/train10'
+dataset_train='./data/ptb.train.txt_3500'
+dataset_valid='./data/ptb.valid.txt_500'
+dataset_test='./data/ptb.test.txt_1000'
+
+# dataset_train='./data/train10'
+# dataset_valid='./data/train10'
+# dataset_test='./data/train10'
 
 indexer = Indexer(dataset_train)
 indexer.build_vocab()
@@ -230,12 +236,9 @@ for epoch in range(n_epoch):
         sentence_grammar = grammar[hash]
         indexed_sentence = indexer.index(sentence)
 
-        prob_sent = traverse(model, indexed_sentence, length, sentence_grammar, train=True)
+        loss = traverse(model, indexed_sentence, length, sentence_grammar, train=True)
 
-        print('Processed sent#{}'.format(epoch_count))
-
-
-        loss = -1 * F.log2(prob_sent)
+        print('Processed sent#{}: {}'.format(epoch_count, loss.data))
         accum_loss += loss
         epoch_count += 1
         batch_count += 1
@@ -243,7 +246,7 @@ for epoch in range(n_epoch):
         if batch_count >= batchsize:
             print('Updating batch gradient for batch: {}'.format(batch))
             batch += 1
-            total_loss += float(accum_loss.data)/n_vocab
+            total_loss += float(accum_loss.data)
             accum_loss /= batch_count
             model.cleargrads()
             accum_loss.backward()
@@ -253,7 +256,6 @@ for epoch in range(n_epoch):
             batch_count = 0
 
             print('loss: {:.5f}'.format(total_loss))
-            print('Validation loss: {:.5f}'.format(float(evaluate(model, valid_sentences))))
             model.clear_z_leaf()
             model.init_z_leaf(True)
 
@@ -262,7 +264,7 @@ for epoch in range(n_epoch):
     print('{:.2f} iters/sec, {:.2f} sec'.format(throughput, now - cur_at))
     print()
 
-    if False and (epoch + 1) % epoch_per_eval == 0:
+    if (epoch + 1) % epoch_per_eval == 0:
         print('Train data evaluation:')
         print(evaluate(model, train_sents))
         print('Develop data evaluation:')

@@ -189,7 +189,6 @@ class InsideScorer(object):
             self.output_filename = "%s.grammar" % input_filename
 
         Grmr = shelve.open(self.output_filename)
-        Grmr.clear()
 
         # write out metadata
         Grmr['metadata'] = {'version': 1.0,
