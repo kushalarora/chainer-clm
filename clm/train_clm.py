@@ -11,6 +11,7 @@ import hashlib
 import re
 import shelve
 import time
+import logging
 
 import numpy as np
 
@@ -22,6 +23,7 @@ from chainer import optimizers
 from datasets import Indexer
 
 
+FLOAT_MIN = 1e-30
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu', '-g', default=-1, type=int,
                     help='GPU ID (negative value indicates CPU)')
@@ -39,10 +41,13 @@ parser.add_argument('--learning-rate', '-l', type=float, default=0.01,
                     help='Learning rate value.')
 parser.add_argument('--l2_reg', '-L', type=float, default=0.01,
                     help='L2 regularization coeff.')
+parser.add_argument('--logging', type=str, default='clm.log',
+                    help='Logging file.')
 parser.add_argument('--test', dest='test', action='store_true')
 parser.set_defaults(test=False)
 
 args = parser.parse_args()
+logging.basicConfig(filename=args.logging,level=logging.INFO)
 if args.gpu >= 0:
     cuda.check_cuda_available()
 xp = cuda.cupy if args.gpu >= 0 else np
@@ -69,7 +74,7 @@ class RecursiveNet(chainer.Chain):
             h2=L.Linear(n_units, 1))
         self.n_vocab = n_vocab
         self.n_units = n_units
-        self.z_leaf = 0
+        self.z_leaf = FLOAT_MIN
 
     def leaf(self, x):
         return self.embed(x)
@@ -90,7 +95,7 @@ class RecursiveNet(chainer.Chain):
             self.z_leaf += self.leaf_unprob(self.leaf(x))
 
     def clear_z_leaf(self):
-        self.z_leaf = 0
+        self.z_leaf = FLOAT_MIN
 
 def traverse(model, sent, length, sentence_grammar, train=True):
     assert isinstance(sent, list)
@@ -104,7 +109,6 @@ def traverse(model, sent, length, sentence_grammar, train=True):
         split = index
 
         word = xp.array([sent[index]], np.int32)
-        loss = 0
         x = chainer.Variable(word, volatile=not train)
         node = model.leaf(x)
         node_map[span] = node
@@ -115,12 +119,12 @@ def traverse(model, sent, length, sentence_grammar, train=True):
         for start in xrange(0, length - diff + 1):
             end = start + diff
             span = (start, end)
-            comp_z = 0
+            comp_z = FLOAT_MIN
 
             if span not in Z:
-                Z[span] = 0
+                Z[span] = FLOAT_MIN
 
-            #print('span: %d, %d' % span)
+            logging.debug('span: %d, %d' % span)
             for split in xrange(start + 1, end):
                 left_span, right_span = ((start, split), (split, end))
                 left_node, right_node = (sent[start:split], sent[split:end])
@@ -189,7 +193,7 @@ optimizer = optimizers.MomentumSGD(lr=learning_rate)
 optimizer.setup(model)
 optimizer.add_hook(chainer.optimizer.WeightDecay(l2_reg))
 
-accum_loss = 0
+accum_loss = long()
 batch_count = 0
 start_at = time.time()
 cur_at = start_at
@@ -197,7 +201,7 @@ cur_at = start_at
 metadata = grammar['metadata']
 num_states = metadata['num_states']
 
-print('Vocab size: {}'.format(n_vocab))
+logging.info('Vocab size: {}'.format(n_vocab))
 
 train_size = 0
 with open(dataset_train) as f:
@@ -214,14 +218,14 @@ with open(dataset_valid) as f:
     valid_sentences = f.readlines()
     valid_size += len(valid_sentences)
 
-print('Training dataset size: {}'.format(train_size))
-print('Valid dataset size: {}'.format(valid_size))
-print('Test dataset size: {}'.format(test_size))
+logging.info('Training dataset size: {}'.format(train_size))
+logging.info('Valid dataset size: {}'.format(valid_size))
+logging.info('Test dataset size: {}'.format(test_size))
 
 for epoch in range(n_epoch):
-    print('Epoch: {0:d}'.format(epoch))
+    logging.info('Epoch: {0:d}'.format(epoch))
     epoch_count = 0
-    total_loss = 0
+    total_loss = long()
     batch = 0
     cur_at = time.time()
     random.shuffle(train_sentences)
@@ -230,45 +234,49 @@ for epoch in range(n_epoch):
     for i, sentence in enumerate(train_sentences):
         sentence = sentence.strip()
         length = len(sentence.split())
-        print('Processing sentence#{}:{}::{}'.format(i, length, sentence))
+        logging.debug('Processing sentence#{}:{}::{}'.format(i, length, sentence))
 
         hash = hashlib.md5(sentence).hexdigest()
         sentence_grammar = grammar[hash]
         indexed_sentence = indexer.index(sentence)
-
         loss = traverse(model, indexed_sentence, length, sentence_grammar, train=True)
 
-        print('Processed sent#{}: {}'.format(epoch_count, loss.data))
+        if not xp.isfinite(loss.data):
+            logging.warn('Non finite loss for sentence: {}'.format(sentence))
+            continue
+
+        logging.debug('Processed sent#{}: {}'.format(epoch_count, loss.data))
         accum_loss += loss
         epoch_count += 1
         batch_count += 1
 
         if batch_count >= batchsize:
-            print('Updating batch gradient for batch: {}'.format(batch))
+            logging.info('Updating batch gradient for batch: {}'.format(batch))
             batch += 1
-            total_loss += float(accum_loss.data)
             accum_loss /= batch_count
             model.cleargrads()
-            accum_loss.backward()
+            try:
+                accum_loss.backward()
+            except Exception,e:
+                logging.error("Failed update for batch %d\n%s" % (batch, e))
+                accum_loss = 0
+
+            total_loss += float(accum_loss.data)
             optimizer.update()
 
             accum_loss = 0
             batch_count = 0
 
-            print('loss: {:.5f}'.format(total_loss))
+            logging.info('loss: {:.5f}'.format(total_loss))
             model.clear_z_leaf()
             model.init_z_leaf(True)
 
     now = time.time()
     throughput = float(train_size) / (now - cur_at)
-    print('{:.2f} iters/sec, {:.2f} sec'.format(throughput, now - cur_at))
-    print()
+    logging.info('{:.2f} iters/sec, {:.2f} sec'.format(throughput, now - cur_at))
 
     if (epoch + 1) % epoch_per_eval == 0:
-        print('Train data evaluation:')
-        print(evaluate(model, train_sents))
-        print('Develop data evaluation:')
-        print(evaluate(model, valid_sents))
-        print('')
-print('Test evaluateion')
-print('Test loss: {:.5f}'.format(float(evaluate(model, test_sentences))))
+        logging.info('Train data evaluation: %.5f' % evaluate(model, train_sents))
+        logging.info('Develop data evaluation: %.5f' % evaluate(model, valid_sents))
+logging.info('Test evaluateion')
+logging.info('Test loss: {:.5f}'.format(float(evaluate(model, test_sentences))))
