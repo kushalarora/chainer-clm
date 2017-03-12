@@ -90,13 +90,13 @@ class RecursiveNet(chainer.Chain):
         return self.u(v)
 
     def leaf_unprob(self, v):
-        return F.exp(self.leaf_energy(v))
+        return F.exp(-1 * self.leaf_energy(v))
 
     def comp_energy(self, parent, left, right):
         return self.u(parent) + self.h1(left) + self.h2(right)
 
     def comp_unprob(self, parent, left, right):
-        return F.exp(self.comp_energy(parent, left, right))
+        return F.exp(-1 * self.comp_energy(parent, left, right))
 
     def init_z_leaf(self, train=False):
             words = xp.array(xrange(self.n_vocab), np.int32)
