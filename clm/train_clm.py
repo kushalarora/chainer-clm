@@ -101,7 +101,7 @@ class RecursiveNet(chainer.Chain):
     def init_z_leaf(self, train=False):
             words = xp.array(xrange(self.n_vocab), np.int32)
             X = chainer.Variable(words, volatile=not train)
-            self.z_leaf = F.sum(self.leaf_unprob(self.leaf(X)))
+            self.z_leaf = F.broadcast_to(F.sum(self.leaf_unprob(self.leaf(X))), (1,1))
 
 
     def clear_z_leaf(self):
