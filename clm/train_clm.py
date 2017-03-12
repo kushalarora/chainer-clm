@@ -15,6 +15,7 @@ import chainer.functions as F
 import chainer.links as L
 from chainer import optimizers
 from datasets import Indexer
+
 from sklearn.decomposition import PCA
 from gensim.models import KeyedVectors
 
@@ -60,7 +61,8 @@ learning_rate = args.learning_rate
 l2_reg = args.l2_reg
 n_em_epoch = args.em_epoch  # number of EM epoch.
 
-chainer.set_debug(True)
+#chainer.set_debug(True)
+
 # Get preprocessed Grammar
 grammar = shelve.open(args.grammar_filename)
 
@@ -97,10 +99,10 @@ class RecursiveNet(chainer.Chain):
         return F.exp(self.comp_energy(parent, left, right))
 
     def init_z_leaf(self, train=False):
-        for i in xrange(0, self.n_vocab):
-            word = xp.array([i], np.int32)
-            x = chainer.Variable(word, volatile=not train)
-            self.z_leaf += self.leaf_unprob(self.leaf(x))
+            words = xp.array(xrange(self.n_vocab), np.int32)
+            X = chainer.Variable(words, volatile=not train)
+            self.z_leaf = F.sum(self.leaf_unprob(self.leaf(X)))
+
 
     def clear_z_leaf(self):
         self.z_leaf = FLOAT_MIN
@@ -355,8 +357,9 @@ logging.info('Training dataset size: {}'.format(train_size))
 logging.info('Valid dataset size: {}'.format(valid_size))
 logging.info('Test dataset size: {}'.format(test_size))
 
-logging.info('Train data evaluation: %.5f'
-             % evaluate(model, train_sentences))
+#logging.info('Train data evaluation: %.5f'
+#             % evaluate(model, train_sentences))
+
 for epoch in range(n_epoch):
     logging.info('Epoch: {0:d}'.format(epoch))
     epoch_count = 0
