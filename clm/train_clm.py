@@ -111,37 +111,43 @@ class RecursiveNet(chainer.Chain):
 def calcZ(model, sent, length, train=False):
     assert isinstance(sent, list)
 
-    if not train:
-        model = model.copy()
+    m = model.copy() if not train else model
 
     Z = {}
     X = {}
+
     # leaf nodes
+    words = xp.array(sent, np.int32)
+    x_batch = chainer.Variable(words, volatile=not train)
+    node_batch = m.leaf(x_batch)
+    Z_batch = m.leaf_unprob(node_batch)
+
     for index in xrange(0, length):
         span = (index, index + 1)
         split = index
 
         if span not in X:
-            X[span] = {0: 0}
+            X[span] = 0
 
         if span not in Z:
             Z[span] = {0: 0}
 
-        word = xp.array([sent[index]], np.int32)
-        x = chainer.Variable(word, volatile=not train)
-        node = model.leaf(x)
 
-        X[span][0] = node
-        Z[span][0] = model.leaf_unprob(node)
+        X[span] = F.broadcast_to(node_batch[index], (1, n_units))
+        Z[span][0] = F.broadcast_to(Z_batch[index], (1, 1))
 
     # internal nodes
     for diff in xrange(2, length + 1):
+        lefts = []
+        rights = []
+        nodes = []
+        positions = []
         for start in xrange(length - diff + 1):
             end = start + diff
             span = (start, end)
 
             if span not in X:
-                X[span] = {0: 0}
+                X[span] = 0
 
             if span not in Z:
                 Z[span] = {0: 0}
@@ -149,21 +155,40 @@ def calcZ(model, sent, length, train=False):
             logging.debug('span: %d, %d' % span)
             for split in xrange(start + 1, end):
                 left_span, right_span = ((start, split), (split, end))
-                left, right = X[left_span][0], X[right_span][0]
+                lefts.append(X[left_span])
+                rights.append(X[right_span])
+                positions.append(((start, end), split))
 
-                X[span][split] = model.node(left, right)
-                Z[span][split] = model.comp_unprob(node, left, right)
+        if len(lefts) > 1:
+            left_batch = F.concat(tuple(lefts), axis=0)
+        else:
+            left_batch = lefts[0]
+        if len(rights) > 1:
+            right_batch = F.concat(tuple(rights), axis=0)
+        else:
+            right_batch = rights[0]
 
-                X[span][0] = Z[span][split].data * node
-                Z[span][0] += Z[span][split]
+        nodes_batch = m.node(left_batch, right_batch)
+        Z_batch = m.comp_unprob(nodes_batch, left_batch, right_batch)
+
+        for i, span_split in enumerate(positions):
+            span, split = span_split
+            node = F.broadcast_to(nodes_batch[i], (1, n_units))
+            Z[span][split] = F.broadcast_to(Z_batch[i], (1, 1))
+
+            X[span] = Z[span][split].data * node
+            Z[span][0] += Z[span][split]
+
+        for start in xrange(length - diff + 1):
+            end = start + diff
+            span = (start, end)
 
             if Z[span][0].data > 0:
-                X[span][0] /= Z[span][0].data
+                X[span] /= Z[span][0].data
 
             for split in xrange(start + 1, end):
                 if Z[span][0].data > 0:
                     Z[span][split] /= Z[span][0]
-
     return Z, X
 
 
@@ -359,6 +384,18 @@ logging.info('Test dataset size: {}'.format(test_size))
 
 #logging.info('Train data evaluation: %.5f'
 #             % evaluate(model, train_sentences))
+
+
+# start_time = time.time()
+# for i, sentence in enumerate(train_sentences):
+    # sentence = sentence.strip()
+    # indexed_sentence = indexer.index(sentence)
+    # length = len(sentence.split())
+    # Z, X = calcZ(model, indexed_sentence, length, train=True)
+# end_time = time.time()
+# print("Calc Z Time: {:.3f}".format(end_time - start_time))
+# import pdb
+# pdb.set_trace()
 
 for epoch in range(n_epoch):
     logging.info('Epoch: {0:d}'.format(epoch))
