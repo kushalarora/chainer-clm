@@ -347,7 +347,6 @@ indexer.build_vocab()
 
 vocab = indexer.get_vocab()
 n_vocab = len(vocab)
-Z_vocab = sum([grammar['vocab'][word] for word in vocab[1:]])
 # initW = embedding_vectors(n_units, vocab, word2vec_file)
 initW = xp.random.uniform(-1, 1, (n_vocab, n_units))
 model = RecursiveNet(n_vocab, n_units, initW)
@@ -365,8 +364,6 @@ batch_count = 0
 start_at = time.time()
 cur_at = start_at
 
-metadata = grammar['metadata']
-num_states = metadata['num_states']
 
 logging.info('Vocab size: {}'.format(n_vocab))
 
@@ -423,7 +420,7 @@ for epoch in range(n_epoch):
                      .format(i, length, sentence))
 
         hash = hashlib.md5(sentence).hexdigest()
-        sentence_grammar = grammar[hash]
+        sentence_grammar = sentence_grammar(sentence) 
         indexed_sentence = indexer.index(sentence)
         A, Mu = EStep(model, indexed_sentence, length, sentence_grammar)
 
