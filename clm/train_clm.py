@@ -64,7 +64,8 @@ n_em_epoch = args.em_epoch  # number of EM epoch.
 #chainer.set_debug(True)
 
 # Get preprocessed Grammar
-grammar = shelve.open(args.grammar_filename)
+if args.grammar_filename:
+    grammar = shelve.open(args.grammar_filename)
 
 
 class RecursiveNet(chainer.Chain):
@@ -289,6 +290,12 @@ def MStep(model, Z, Mu, A, length):
 
         return loss/A[(0, length)][0]
 
+def sentence_grammar(sentence):
+    if grammar is not None:
+        hash = hashlib.md5(sentence).hexdigest()
+        return grammar[hash]
+    return None
+
 
 def evaluate(model, test_sents):
     m = model.copy()
@@ -299,7 +306,7 @@ def evaluate(model, test_sents):
     for sentence in test_sents:
         sentence = sentence.strip()
         hash = hashlib.md5(sentence).hexdigest()
-        sentence_grammar = grammar[hash]
+        sentence_grammar = sentence_grammar(sentence) 
         indexed_sentence = indexer.index(sentence)
         length = len(indexed_sentence)
         Z, X = calcZ(model, indexed_sentence, length, train=False)
