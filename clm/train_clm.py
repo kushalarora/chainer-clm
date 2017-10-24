@@ -11,16 +11,14 @@ import numpy as np
 
 import chainer
 from chainer import cuda
-import chainer.functions as F
-import chainer.links as L
 from chainer import optimizers
 from datasets import Indexer
 
-from sklearn.decomposition import PCA
 from gensim.models import KeyedVectors
+from model import RecursiveNet
+from sklearn.decomposition import PCA
 
 
-FLOAT_MIN = 1e-30
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu', '-g', default=-1, type=int,
                     help='GPU ID (negative value indicates CPU)')
@@ -51,6 +49,7 @@ logging.basicConfig(filename=args.logging, level=logging.INFO)
 
 if args.gpu >= 0:
     cuda.check_cuda_available()
+
 xp = cuda.cupy if args.gpu >= 0 else np
 
 n_epoch = args.epoch        # number of epochs.
@@ -64,292 +63,61 @@ n_em_epoch = args.em_epoch  # number of EM epoch.
 #chainer.set_debug(True)
 
 # Get preprocessed Grammar
-if args.grammar_filename:
-    grammar = shelve.open(args.grammar_filename)
+grammar = shelve.open(args.grammar_filename) \
+            if args.grammar_filename else None
+
+dataset_train = './data/train1'
+dataset_valid = '../data/test'
+dataset_test = '../data/test'
+word2vec_file = '~/GoogleNews-vectors-negative300.bin'
+
+indexer = Indexer(dataset_train)
+indexer.build_vocab()
 
 
-class RecursiveNet(chainer.Chain):
-    def __init__(self, n_vocab, n_units, embeddings):
-        super(RecursiveNet, self).__init__(
-            embed=L.EmbedID(n_vocab, n_units, initialW=embeddings),
-            # E=L.Linear(300, n_units),
-            w=L.Linear(n_units * 2, n_units),
-            u=L.Linear(n_units, 1),
-            h1=L.Linear(n_units, 1),
-            h2=L.Linear(n_units, 1))
-        self.n_vocab = n_vocab
-        self.n_units = n_units
-        self.z_leaf = FLOAT_MIN
-
-    def leaf(self, x):
-        return self.embed(x)
-
-    def node(self, left, right):
-        return F.tanh(self.w(F.concat((left, right))))
-
-    def leaf_energy(self, v):
-        return self.u(v)
-
-    def leaf_unprob(self, v):
-        return F.exp(-1 * self.leaf_energy(v))
-
-    def comp_energy(self, parent, left, right):
-        return self.u(parent) + self.h1(left) + self.h2(right)
-
-    def comp_unprob(self, parent, left, right):
-        return F.exp(-1 * self.comp_energy(parent, left, right))
-
-    def init_z_leaf(self, train=False):
-            words = xp.array(xrange(self.n_vocab), np.int32)
-            X = chainer.Variable(words, volatile=not train)
-            self.z_leaf = F.broadcast_to(F.sum(self.leaf_unprob(self.leaf(X))), (1,1))
-
-
-    def clear_z_leaf(self):
-        self.z_leaf = FLOAT_MIN
-
-
-def calcZ(model, sent, length, train=False):
-    assert isinstance(sent, list)
-
-    m = model.copy() if not train else model
-
-    Z = {}
-    X = {}
-
-    # leaf nodes
-    words = xp.array(sent, np.int32)
-    x_batch = chainer.Variable(words, volatile=not train)
-    node_batch = m.leaf(x_batch)
-    Z_batch = m.leaf_unprob(node_batch)
-
-    for index in xrange(0, length):
-        span = (index, index + 1)
-        split = index
-
-        if span not in X:
-            X[span] = 0
-
-        if span not in Z:
-            Z[span] = {0: 0}
-
-
-        X[span] = F.broadcast_to(node_batch[index], (1, n_units))
-        Z[span][0] = F.broadcast_to(Z_batch[index], (1, 1))
-
-    # internal nodes
-    for diff in xrange(2, length + 1):
-        lefts = []
-        rights = []
-        nodes = []
-        positions = []
-        for start in xrange(length - diff + 1):
-            end = start + diff
-            span = (start, end)
-
-            if span not in X:
-                X[span] = 0
-
-            if span not in Z:
-                Z[span] = {0: 0}
-
-            logging.debug('span: %d, %d' % span)
-            for split in xrange(start + 1, end):
-                left_span, right_span = ((start, split), (split, end))
-                lefts.append(X[left_span])
-                rights.append(X[right_span])
-                positions.append(((start, end), split))
-
-        if len(lefts) > 1:
-            left_batch = F.concat(tuple(lefts), axis=0)
-        else:
-            left_batch = lefts[0]
-        if len(rights) > 1:
-            right_batch = F.concat(tuple(rights), axis=0)
-        else:
-            right_batch = rights[0]
-
-        nodes_batch = m.node(left_batch, right_batch)
-        Z_batch = m.comp_unprob(nodes_batch, left_batch, right_batch)
-
-        for i, span_split in enumerate(positions):
-            span, split = span_split
-            node = F.broadcast_to(nodes_batch[i], (1, n_units))
-            Z[span][split] = F.broadcast_to(Z_batch[i], (1, 1))
-
-            X[span] = Z[span][split].data * node
-            Z[span][0] += Z[span][split]
-
-        for start in xrange(length - diff + 1):
-            end = start + diff
-            span = (start, end)
-
-            if Z[span][0].data > 0:
-                X[span] /= Z[span][0].data
-
-            for split in xrange(start + 1, end):
-                if Z[span][0].data > 0:
-                    Z[span][split] /= Z[span][0]
-    return Z, X
-
-
-def inside(model, sent, length, sentence_grammar, Z, train=False):
+def generate_rnn_grammar(sentence):
     A = {}
-    # leaf nodes
-    for index in xrange(0, length):
-        span = (index, index + 1)
-        split = index
+    length = len(indexer.tokenize(sentence))
+    for end in range(1, length + 1):
+        span = (0, end)
+        A[span] = {end - 1 : 1}
 
-        if span not in A:
-            A[span] = {0: 0}
-
-        A[span][0] = Z[span][0].data
-
-    # internal nodes
-    for diff in xrange(2, length + 1):
-        for start in xrange(length - diff + 1):
-            end = start + diff
-            span = (start, end)
-
-            if span not in A:
-                A[span] = {0: 0}
-
-            logging.debug('span: %d, %d' % span)
-            for split in xrange(start + 1, end):
-                left_span, right_span = ((start, split), (split, end))
-                A[span][split] = Z[span][split].data * \
-                    sentence_grammar[span][split] * \
-                    A[left_span][0] * \
-                    A[right_span][0]
-
-                A[span][0] += A[span][split]
     return A
 
-
-def outside(model, A, Z, X, length):
-    B = {(0, length): xp.array([[1.0]])}
-    for diff in reversed(xrange(1, length + 1)):
-        for start in xrange(length + 1 - diff):
-            end = start + diff
-            span = (start, end)
-            for split in xrange(start + 1, end):
-                left_span, right_span = ((start, split), (split, end))
-                B[left_span] = B[span] * Z[span][split].data * A[right_span][0]
-                B[right_span] = B[span] * Z[span][split].data * A[left_span][0]
-    return B
-
-
-def mu(A, B, length):
-    Mu = {}
-    for index in xrange(0, length):
-        span = (index, index + 1)
-        split = index
-
-        if span not in Mu:
-            Mu[span] = {}
-
-        Mu[span][0] = A[span][0] * B[span][0]
-
-    for diff in xrange(2, length + 1):
-        for start in xrange(length + 1 - diff):
-            end = start + diff
-            span = (start, end)
-
-            if span not in Mu:
-                Mu[span] = {}
-
-            Mu[span][0] = A[span][0] * B[span][0]
-            for split in xrange(start + 1, end):
-                Mu[span][split] = A[span][split] * B[span][0]
-    return Mu
-
-
-def EStep(model, sent, length, sentence_grammar):
-    Z, X = calcZ(model, sent, length, train=False)
-    A = inside(model, sent, length, sentence_grammar, Z, train=True)
-    B = outside(model, A, Z, X, length)
-    Mu = mu(A, B, length)
-    return A, Mu
-
-
-def MStep(model, Z, Mu, A, length):
-        loss = 0
-        for index in xrange(0, length):
-            span = (index, index + 1)
-            split = index
-
-            loss += (-F.log(Z[span][0]) + F.log(model.z_leaf)) * Mu[span][0]
-
-        for diff in xrange(2, length + 1):
-            for start in xrange(0, length + 1 - diff):
-                end = start + diff
-                span = (start, end)
-
-                for split in xrange(start + 1, end):
-                    loss += -F.log(Z[span][split]) * Mu[span][split]
-
-        return loss/A[(0, length)][0]
-
-def sentence_grammar(sentence):
+def get_sentence_grammar(sentence):
     if grammar is not None:
         hash = hashlib.md5(sentence).hexdigest()
         return grammar[hash]
-    return None
-
+    return generate_rnn_grammar(sentence) 
 
 def evaluate(model, test_sents):
     m = model.copy()
     m.clear_z_leaf()
-    m.init_z_leaf()
-    m.volatile = True
+    m.init_z_leaf(words)
     entropy = 0
     for sentence in test_sents:
         sentence = sentence.strip()
-        hash = hashlib.md5(sentence).hexdigest()
-        sentence_grammar = sentence_grammar(sentence) 
+        sentence_grammar = get_sentence_grammar(sentence) 
         indexed_sentence = indexer.index(sentence)
         length = len(indexed_sentence)
-        Z, X = calcZ(model, indexed_sentence, length, train=False)
-        A = inside(m, indexed_sentence,
-                   length, sentence_grammar,
-                   Z, train=False)
-
-        entropy += -np.log2(A[0, length][0]) + \
-            length * np.log2(m.z_leaf.data)
-
+        A = inside(m, indexed_sentence, length, sentence_grammar, train=False)
+        entropy += -np.log2(A[0, length][0]) + length * np.log2(m.z_leaf.data)
     return entropy
 
 
 def embedding_vectors(n_units, vocab, word2vec_file):
     model = KeyedVectors.load_word2vec_format(word2vec_file, binary=True)
-    model_vocab = ['unk' if word not in model else word for word in vocab]
-    emb_300 = model[model_vocab]
     # return emb_300
     pca = PCA(n_components=n_units)
     return pca.fit_transform(emb_300)
-
-# vocab = {}
-
-
-if args.test:
-    max_size = 10
-else:
-    max_size = None
-
-
-dataset_train = './data/ptb.valid.txt_500'
-dataset_valid = './data/ptb.valid.txt_500'
-dataset_test = './data/ptb.test.txt_1000'
-word2vec_file = '~/GoogleNews-vectors-negative300.bin'
-
-indexer = Indexer(dataset_train)
-indexer.build_vocab()
 
 vocab = indexer.get_vocab()
 n_vocab = len(vocab)
 # initW = embedding_vectors(n_units, vocab, word2vec_file)
 initW = xp.random.uniform(-1, 1, (n_vocab, n_units))
 model = RecursiveNet(n_vocab, n_units, initW)
+
+words = xp.array(xrange(n_vocab), np.int32)
 
 if args.gpu >= 0:
     model.to_gpu()
@@ -363,7 +131,6 @@ accum_loss = long()
 batch_count = 0
 start_at = time.time()
 cur_at = start_at
-
 
 logging.info('Vocab size: {}'.format(n_vocab))
 
@@ -389,18 +156,7 @@ logging.info('Test dataset size: {}'.format(test_size))
 #logging.info('Train data evaluation: %.5f'
 #             % evaluate(model, train_sentences))
 
-
-# start_time = time.time()
-# for i, sentence in enumerate(train_sentences):
-    # sentence = sentence.strip()
-    # indexed_sentence = indexer.index(sentence)
-    # length = len(sentence.split())
-    # Z, X = calcZ(model, indexed_sentence, length, train=True)
-# end_time = time.time()
-# print("Calc Z Time: {:.3f}".format(end_time - start_time))
-# import pdb
-# pdb.set_trace()
-
+import pdb;pdb.set_trace()
 for epoch in range(n_epoch):
     logging.info('Epoch: {0:d}'.format(epoch))
     epoch_count = 0
@@ -409,7 +165,7 @@ for epoch in range(n_epoch):
     cur_at = time.time()
     random.shuffle(train_sentences)
 
-    model.init_z_leaf(True)
+    model.init_z_leaf(words)
     As = {}
     Mus = {}
     sentences = {}
@@ -420,52 +176,37 @@ for epoch in range(n_epoch):
                      .format(i, length, sentence))
 
         hash = hashlib.md5(sentence).hexdigest()
-        sentence_grammar = sentence_grammar(sentence) 
+        sentence_grammar = get_sentence_grammar(sentence) 
         indexed_sentence = indexer.index(sentence)
-        A, Mu = EStep(model, indexed_sentence, length, sentence_grammar)
+        loss = model.forward(xp.array(indexed_sentence, np.int32),
+                          sentence_grammar)
 
-        As[hash] = A
-        Mus[hash] = Mu
-        sentences[hash] = indexed_sentence
+        logging.debug('Processed sentence#{}=>{}'
+                      .format(i, loss.data))
+
         epoch_count += 1
         batch_count += 1
+        
+        accum_los += loss
 
         if batch_count >= batchsize:
-            for em_epoch in xrange(n_em_epoch):
-                logging.info('EM epoch: {0:d}'.format(em_epoch))
-                for hash, sentence in sentences.iteritems():
-                    length = len(sentence)
-                    Z, X = calcZ(model, sentence, length, train=True)
-                    A = As[hash]
-                    Mu = Mus[hash]
-
-                    loss = MStep(model, Z, Mu, A, length)
-                    logging.debug('Processed sentence#{}:{}=>{}'
-                                  .format(epoch_count, em_epoch, loss.data))
-                    accum_loss += loss
-
-                logging.info('Updating batch gradient for batch: {}'
-                             .format(batch))
-                batch += 1
-                logging.info('loss: {:.5f}'.format(float(accum_loss.data)))
-                model.cleargrads()
-                try:
-                    accum_loss.backward()
-                except Exception, e:
-                    logging.error("Failed update for batch %d\n%s"
-                                  % (batch, e))
-                    accum_loss = 0
-
+            logging.info('Updating batch gradient for batch: {}'
+                         .format(batch))
+            batch += 1
+            logging.info('loss: {:.5f}'.format(float(accum_loss.data)))
+            try:
+                accum_loss.backward()
                 optimizer.update()
-
+            except Exception, e:
+                logging.error("Failed update for batch %d\n%s"
+                              % (batch, e))
+            finally:
                 accum_loss = 0
+                model.cleargrads()
 
-                model.clear_z_leaf()
-                model.init_z_leaf(True)
+            model.clear_z_leaf()
+            model.init_z_leaf(words)
             batch_count = 0
-            As.clear()
-            Mus.clear()
-            sentences.clear()
 
     now = time.time()
     throughput = float(train_size) / (now - cur_at)

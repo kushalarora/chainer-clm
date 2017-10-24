@@ -13,7 +13,7 @@ class Indexer(object):
 
         index = 1
         for line in fin:
-            words = line.split()
+            words = self.tokenize(line) 
             for i, word in enumerate(words):
                 if word not in self.vocab_dict:
                     self.vocab_dict[word] = index
@@ -28,7 +28,7 @@ class Indexer(object):
             raise BaseException("No vocabulary found. Call build_vocab method first.")
 
         indexes = []
-        words = sentence.split()
+        words = self.tokenize(sentence) 
         for word in words:
             try:
                 id = self.vocab_dict[word]
@@ -42,3 +42,7 @@ class Indexer(object):
 
             indexes.append(id)
         return indexes
+
+    def tokenize(self, sentence):
+        return sentence.strip().split() + ['<eos>'] 
+
